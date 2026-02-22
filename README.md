@@ -779,6 +779,27 @@ Two transport modes are supported:
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
+To route built-in `web_search` / `web_fetch` through Tavily MCP, set:
+
+```json
+{
+  "tools": {
+    "web": {
+      "search": {
+        "backend": "mcp",
+        "mcpServer": "tavily",
+        "mcpTool": "tavily_search"
+      },
+      "fetch": {
+        "backend": "mcp",
+        "mcpServer": "tavily",
+        "mcpTool": "tavily_extract"
+      }
+    }
+  }
+}
+```
+
 
 
 

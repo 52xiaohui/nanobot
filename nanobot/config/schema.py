@@ -1,6 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
+
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
@@ -236,14 +238,27 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
+    backend: Literal["brave", "mcp", "disabled"] = "brave"
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
+    mcp_server: str = "tavily"  # MCP server name under tools.mcpServers
+    mcp_tool: str = "tavily_search"  # MCP tool name exposed by the server
+
+
+class WebFetchConfig(Base):
+    """Web fetch tool configuration."""
+
+    backend: Literal["builtin", "mcp", "disabled"] = "builtin"
+    max_chars: int = 50000
+    mcp_server: str = "tavily"  # MCP server name under tools.mcpServers
+    mcp_tool: str = "tavily_extract"  # MCP tool name exposed by the server
 
 
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
 
 
 class ExecToolConfig(Base):

@@ -1,7 +1,10 @@
+import json
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool, register_web_tools
+from nanobot.config.schema import WebToolsConfig
 
 
 class SampleTool(Tool):
@@ -86,3 +89,84 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+async def test_web_search_mcp_maps_params_and_formats_results() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def _mcp_execute(name: str, params: dict) -> str:
+        calls.append((name, params))
+        return json.dumps(
+            {
+                "results": [
+                    {
+                        "title": "Result A",
+                        "url": "https://example.com/a",
+                        "content": "Snippet A",
+                    }
+                ]
+            }
+        )
+
+    tool = WebSearchTool(
+        backend="mcp",
+        mcp_server="tavily",
+        mcp_tool="tavily_search",
+        mcp_executor=_mcp_execute,
+    )
+    result = await tool.execute(query="nanobot", count=99)
+
+    assert calls == [
+        (
+            "mcp_tavily_tavily_search",
+            {"query": "nanobot", "max_results": 10},
+        )
+    ]
+    assert "Results for: nanobot" in result
+    assert "https://example.com/a" in result
+
+
+async def test_web_fetch_mcp_maps_params_and_applies_truncation() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def _mcp_execute(name: str, params: dict) -> str:
+        calls.append((name, params))
+        return json.dumps(
+            {
+                "results": [
+                    {"url": "https://example.com/a", "content": "1234567890"},
+                ]
+            }
+        )
+
+    tool = WebFetchTool(
+        backend="mcp",
+        max_chars=6,
+        mcp_server="tavily",
+        mcp_tool="tavily_extract",
+        mcp_executor=_mcp_execute,
+    )
+    raw = await tool.execute(url="https://example.com/a", extractMode="text")
+    data = json.loads(raw)
+
+    assert calls == [
+        (
+            "mcp_tavily_tavily_extract",
+            {"urls": ["https://example.com/a"], "format": "text"},
+        )
+    ]
+    assert data["extractor"] == "mcp:mcp_tavily_tavily_extract"
+    assert data["truncated"] is True
+    assert data["text"] == "## htt"
+
+
+def test_register_web_tools_respects_disabled_backends() -> None:
+    cfg = WebToolsConfig()
+    cfg.search.backend = "disabled"
+    cfg.fetch.backend = "disabled"
+
+    reg = ToolRegistry()
+    register_web_tools(reg, cfg)
+
+    assert not reg.has("web_search")
+    assert not reg.has("web_fetch")

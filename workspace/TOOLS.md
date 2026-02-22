@@ -45,21 +45,25 @@ exec(command: str, working_dir: str = None) -> str
 ## Web Access
 
 ### web_search
-Search the web using Brave Search API.
+Search the web using the configured backend (`brave` or `mcp`).
 ```
 web_search(query: str, count: int = 5) -> str
 ```
 
-Returns search results with titles, URLs, and snippets. Requires `tools.web.search.apiKey` in config.
+Returns search results with titles, URLs, and snippets.
+Default backend is Brave (`tools.web.search.backend = "brave"`), which uses
+`tools.web.search.apiKey`. You can switch to MCP (for example Tavily) with:
+`tools.web.search.backend = "mcp"` and `tools.web.search.mcpServer/mcpTool`.
 
 ### web_fetch
-Fetch and extract main content from a URL.
+Fetch and extract main content from a URL using the configured backend (`builtin` or `mcp`).
 ```
 web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 ```
 
 **Notes:**
-- Content is extracted using readability
+- Builtin backend extracts content using readability
+- MCP backend can route to tools like Tavily extract
 - Supports markdown or plain text extraction
 - Output is truncated at 50,000 characters by default
 
