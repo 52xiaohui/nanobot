@@ -2,8 +2,8 @@
   <img src="nanobot_logo.png" alt="nanobot" width="500">
   <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
   <p>
-    <a href="https://pypi.org/project/nanobot-ai/"><img src="https://img.shields.io/pypi/v/nanobot-ai" alt="PyPI"></a>
-    <a href="https://pepy.tech/project/nanobot-ai"><img src="https://static.pepy.tech/badge/nanobot-ai" alt="Downloads"></a>
+    <a href="https://pypi.org/project/nanohui/"><img src="https://img.shields.io/pypi/v/nanohui" alt="PyPI"></a>
+    <a href="https://pepy.tech/project/nanohui"><img src="https://static.pepy.tech/badge/nanohui" alt="Downloads"></a>
     <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
@@ -99,13 +99,13 @@ pip install -e .
 **Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
 
 ```bash
-uv tool install nanobot-ai
+uv tool install nanohui
 ```
 
 **Install from PyPI** (stable)
 
 ```bash
-pip install nanobot-ai
+pip install nanohui
 ```
 
 ## 🚀 Quick Start
