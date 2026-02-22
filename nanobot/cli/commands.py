@@ -283,14 +283,29 @@ def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+    from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
     from nanobot.providers.custom_provider import CustomProvider
 
     model = config.agents.defaults.model
+    model_lower = model.lower()
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
 
+    # OpenAI Responses API (API key based)
+    if model_lower.startswith("openai-responses/") or model_lower.startswith("openai_responses/"):
+        openai_cfg = config.providers.openai
+        if not openai_cfg.api_key:
+            console.print("[red]Error: No OpenAI API key configured.[/red]")
+            console.print("Set one in ~/.nanobot/config.json under providers.openai.apiKey")
+            raise typer.Exit(1)
+        return OpenAIResponsesProvider(
+            api_key=openai_cfg.api_key,
+            api_base=openai_cfg.api_base,
+            default_model=model,
+        )
+
     # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
+    if provider_name == "openai_codex" or model_lower.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
