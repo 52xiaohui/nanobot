@@ -7,8 +7,15 @@ from typer.testing import CliRunner
 
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config
+from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
+from nanobot.providers.openai_responses_provider import (
+    OpenAIResponsesProvider,
+    _convert_messages,
+    _parse_response,
+    _strip_responses_model_prefix,
+)
 from nanobot.providers.registry import find_by_model
 
 runner = CliRunner()
@@ -128,3 +135,78 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_openai_responses_strip_prefix_supports_hyphen_and_underscore():
+    assert _strip_responses_model_prefix("openai-responses/gpt-5") == "gpt-5"
+    assert _strip_responses_model_prefix("openai_responses/gpt-5") == "gpt-5"
+    assert _strip_responses_model_prefix("OpenAI-Responses/gpt-5") == "gpt-5"
+
+
+def test_make_provider_uses_openai_responses_for_prefixed_model():
+    from nanobot.cli.commands import _make_provider
+
+    config = Config()
+    config.providers.openai.api_key = "sk-test"
+    config.agents.defaults.model = "openai-responses/gpt-5"
+
+    provider = _make_provider(config)
+
+    assert isinstance(provider, OpenAIResponsesProvider)
+    assert provider.get_default_model() == "openai-responses/gpt-5"
+
+
+def test_openai_responses_convert_messages_keeps_tool_call_id_roundtrip():
+    instructions, input_items = _convert_messages(
+        [
+            {"role": "system", "content": "be concise"},
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [
+                    {
+                        "id": "call_abc|fc_abc",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"weather\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc|fc_abc", "name": "web_search", "content": "sunny"},
+        ]
+    )
+
+    assert instructions == "be concise"
+    assert any(item.get("type") == "function_call" and item.get("call_id") == "call_abc" for item in input_items)
+    assert any(
+        item.get("type") == "function_call_output" and item.get("call_id") == "call_abc"
+        for item in input_items
+    )
+
+
+def test_openai_responses_parse_response_extracts_content_and_tool_calls():
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello"}],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": "{\"text\":\"hi\"}",
+            },
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+    }
+
+    out = _parse_response(payload)
+
+    assert out.content == "Hello"
+    assert out.finish_reason == "stop"
+    assert out.usage == {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+    assert out.tool_calls == [ToolCallRequest(id="call_1|fc_1", name="echo", arguments={"text": "hi"})]
