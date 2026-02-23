@@ -1,0 +1,7 @@
+workspace:
+  launch:
+    button:
+      eventName: vscode
+      name: Start Codex Dev
+      description: Launch custom vscode pipeline with Codex, synced ~/.cnb/codex, and max keepalive timeout.
+    autoOpenWebIDE: true
