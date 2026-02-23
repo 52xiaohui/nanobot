@@ -16,7 +16,7 @@ $:
         - name: bootstrap
           script:
             - mkdir -p "$HOME/.cnb/codex/rules" "$HOME/.cnb/codex/skills" "$HOME/.codex"
-            - mkdir -p "$HOME/.cnb/.copilot"
+            - mkdir -p "$HOME/.cnb/.copilot" "$HOME/.copilot"
             - for name in rules skills; do if [ -d "$HOME/.codex/$name" ] && [ ! -L "$HOME/.codex/$name" ] && [ -z "$(ls -A "$HOME/.cnb/codex/$name" 2>/dev/null)" ]; then cp -a "$HOME/.codex/$name/." "$HOME/.cnb/codex/$name/" || true; fi; rm -rf "$HOME/.codex/$name"; ln -sfn "$HOME/.cnb/codex/$name" "$HOME/.codex/$name"; done
             - for name in config.toml auth.json; do if [ -f "$HOME/.codex/$name" ] && [ ! -L "$HOME/.codex/$name" ] && [ ! -s "$HOME/.cnb/codex/$name" ]; then cp "$HOME/.codex/$name" "$HOME/.cnb/codex/$name"; fi; touch "$HOME/.cnb/codex/$name"; rm -f "$HOME/.codex/$name"; ln -sfn "$HOME/.cnb/codex/$name" "$HOME/.codex/$name"; done
             - if [ -f "$HOME/.copilot/config.json" ] && [ ! -L "$HOME/.copilot/config.json" ] && [ ! -s "$HOME/.cnb/.copilot/config.json" ]; then cp "$HOME/.copilot/config.json" "$HOME/.cnb/.copilot/config.json"; fi; touch "$HOME/.cnb/.copilot/config.json"; rm -f "$HOME/.copilot/config.json"; ln -sfn "$HOME/.cnb/.copilot/config.json" "$HOME/.copilot/config.json"
