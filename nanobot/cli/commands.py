@@ -383,6 +383,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
     )
     
     # Set cron callback (needs agent)
@@ -404,20 +405,42 @@ def gateway(
         return response
     cron.on_job = on_cron_job
     
+    # Create channel manager
+    channels = ChannelManager(config, bus)
+
+    def _pick_heartbeat_target() -> tuple[str, str]:
+        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        enabled = set(channels.enabled_channels)
+        # Prefer the most recently updated non-internal session on an enabled channel.
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if ":" not in key:
+                continue
+            channel, chat_id = key.split(":", 1)
+            if channel in {"cli", "system"}:
+                continue
+            if channel in enabled and chat_id:
+                return channel, chat_id
+        # Fallback keeps prior behavior but remains explicit.
+        return "cli", "direct"
+
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
         """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
-    
+        channel, chat_id = _pick_heartbeat_target()
+        return await agent.process_direct(
+            prompt,
+            session_key="heartbeat",
+            channel=channel,
+            chat_id=chat_id,
+        )
+
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         on_heartbeat=on_heartbeat,
         interval_s=30 * 60,  # 30 minutes
         enabled=True
     )
-    
-    # Create channel manager
-    channels = ChannelManager(config, bus)
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -499,6 +522,7 @@ def agent(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -509,7 +533,12 @@ def agent(
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
 
-    async def _cli_progress(content: str) -> None:
+    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+        ch = agent_loop.channels_config
+        if ch and tool_hint and not ch.send_tool_hints:
+            return
+        if ch and not tool_hint and not ch.send_progress:
+            return
         console.print(f"  [dim]↳ {content}[/dim]")
 
     if message:
@@ -550,7 +579,14 @@ def agent(
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         if msg.metadata.get("_progress"):
-                            console.print(f"  [dim]↳ {msg.content}[/dim]")
+                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            ch = agent_loop.channels_config
+                            if ch and is_tool_hint and not ch.send_tool_hints:
+                                pass
+                            elif ch and not is_tool_hint and not ch.send_progress:
+                                pass
+                            else:
+                                console.print(f"  [dim]↳ {msg.content}[/dim]")
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
@@ -976,6 +1012,7 @@ def cron_run(
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"
