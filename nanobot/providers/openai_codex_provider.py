@@ -12,6 +12,10 @@ from loguru import logger
 
 from oauth_cli_kit import get_token as get_codex_token
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.responses_compat import (
+    convert_messages as _convert_messages,
+    convert_tools as _convert_tools,
+)
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
@@ -31,9 +35,10 @@ class OpenAICodexProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        request_options: dict[str, Any] | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
-        system_prompt, input_items = _convert_messages(messages)
+        system_prompt, input_items = _convert_messages(messages, join_system_messages=False)
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
@@ -53,17 +58,22 @@ class OpenAICodexProvider(LLMProvider):
 
         if tools:
             body["tools"] = _convert_tools(tools)
+        reasoning_effort = _reasoning_effort(request_options)
+        if reasoning_effort:
+            body["reasoning"] = {"effort": reasoning_effort}
 
         url = DEFAULT_CODEX_URL
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex_with_ssl_fallback(url, headers, body)
             except Exception as e:
-                if "CERTIFICATE_VERIFY_FAILED" not in str(e):
+                if "reasoning" in body and _is_reasoning_effort_error(str(e)):
+                    body = dict(body)
+                    body.pop("reasoning", None)
+                    content, tool_calls, finish_reason = await _request_codex_with_ssl_fallback(url, headers, body)
+                else:
                     raise
-                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
@@ -111,110 +121,18 @@ async def _request_codex(
             return await _consume_sse(response)
 
 
-def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert OpenAI function-calling schema to Codex flat format."""
-    converted: list[dict[str, Any]] = []
-    for tool in tools:
-        fn = (tool.get("function") or {}) if tool.get("type") == "function" else tool
-        name = fn.get("name")
-        if not name:
-            continue
-        params = fn.get("parameters") or {}
-        converted.append({
-            "type": "function",
-            "name": name,
-            "description": fn.get("description") or "",
-            "parameters": params if isinstance(params, dict) else {},
-        })
-    return converted
-
-
-def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    system_prompt = ""
-    input_items: list[dict[str, Any]] = []
-
-    for idx, msg in enumerate(messages):
-        role = msg.get("role")
-        content = msg.get("content")
-
-        if role == "system":
-            system_prompt = content if isinstance(content, str) else ""
-            continue
-
-        if role == "user":
-            input_items.append(_convert_user_message(content))
-            continue
-
-        if role == "assistant":
-            # Handle text first.
-            if isinstance(content, str) and content:
-                input_items.append(
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": content}],
-                        "status": "completed",
-                        "id": f"msg_{idx}",
-                    }
-                )
-            # Then handle tool calls.
-            for tool_call in msg.get("tool_calls", []) or []:
-                fn = tool_call.get("function") or {}
-                call_id, item_id = _split_tool_call_id(tool_call.get("id"))
-                call_id = call_id or f"call_{idx}"
-                item_id = item_id or f"fc_{idx}"
-                input_items.append(
-                    {
-                        "type": "function_call",
-                        "id": item_id,
-                        "call_id": call_id,
-                        "name": fn.get("name"),
-                        "arguments": fn.get("arguments") or "{}",
-                    }
-                )
-            continue
-
-        if role == "tool":
-            call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            input_items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output_text,
-                }
-            )
-            continue
-
-    return system_prompt, input_items
-
-
-def _convert_user_message(content: Any) -> dict[str, Any]:
-    if isinstance(content, str):
-        return {"role": "user", "content": [{"type": "input_text", "text": content}]}
-    if isinstance(content, list):
-        converted: list[dict[str, Any]] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text":
-                converted.append({"type": "input_text", "text": item.get("text", "")})
-            elif item.get("type") == "image_url":
-                url = (item.get("image_url") or {}).get("url")
-                if url:
-                    converted.append({"type": "input_image", "image_url": url, "detail": "auto"})
-        if converted:
-            return {"role": "user", "content": converted}
-    return {"role": "user", "content": [{"type": "input_text", "text": ""}]}
-
-
-def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
-    if isinstance(tool_call_id, str) and tool_call_id:
-        if "|" in tool_call_id:
-            call_id, item_id = tool_call_id.split("|", 1)
-            return call_id, item_id or None
-        return tool_call_id, None
-    return "call_0", None
+async def _request_codex_with_ssl_fallback(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> tuple[str, list[ToolCallRequest], str]:
+    try:
+        return await _request_codex(url, headers, body, verify=True)
+    except Exception as e:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(e):
+            raise
+        logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
+        return await _request_codex(url, headers, body, verify=False)
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
@@ -222,12 +140,30 @@ def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _reasoning_effort(request_options: dict[str, Any] | None) -> str | None:
+    if not isinstance(request_options, dict):
+        return None
+    value = request_options.get("reasoning_effort")
+    if isinstance(value, str):
+        value = value.lower().strip()
+        if value in {"low", "medium", "high"}:
+            return value
+    return None
+
+
+def _is_reasoning_effort_error(message: str) -> bool:
+    text = message.lower()
+    if "reasoning" not in text:
+        return False
+    return any(part in text for part in ("unsupported", "unknown", "invalid", "not allowed"))
+
+
 async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
     buffer: list[str] = []
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [line_item[5:].strip() for line_item in buffer if line_item.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue

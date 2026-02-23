@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.commands import (
+    RuntimeSettings,
+    SlashCommandRouter,
+    build_request_options,
+    resolve_effective_model,
+)
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
@@ -24,10 +30,11 @@ from nanobot.agent.tools.web import register_web_tools
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
+from nanobot.providers.factory import ProviderCreateError, ProviderFactory
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
+    from nanobot.config.schema import ChannelsConfig, Config, ExecToolConfig, WebToolsConfig
     from nanobot.cron.service import CronService
 
 
@@ -48,6 +55,8 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        config: Config | None = None,
+        provider_factory: ProviderFactory | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -62,12 +71,18 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, WebToolsConfig
+        from nanobot.config.schema import Config, ExecToolConfig, WebToolsConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
+        user_config_provided = config is not None
+        self.config = config.model_copy(deep=True) if config else Config()
+        self.provider_factory = provider_factory or ProviderFactory()
         self.workspace = workspace
-        self.model = model or provider.get_default_model()
+        self.default_model = model or self.config.agents.defaults.model or provider.get_default_model()
+        self.model = self.default_model
+        if not user_config_provided or not self.config.agents.defaults.model:
+            self.config.agents.defaults.model = self.default_model
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -105,6 +120,14 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._consolidation_runtime_overrides: dict[int, RuntimeSettings] = {}
+        self.command_router = SlashCommandRouter(
+            config=self.config,
+            sessions=self.sessions,
+            provider_factory=self.provider_factory,
+            resolve_runtime_settings=self._runtime_settings,
+            handle_new=self._handle_new_command,
+        )
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -149,7 +172,13 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        runtime_settings: RuntimeSettings | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -158,6 +187,12 @@ class AgentLoop:
         if spawn_tool := self.tools.get("spawn"):
             if isinstance(spawn_tool, SpawnTool):
                 spawn_tool.set_context(channel, chat_id)
+                if runtime_settings:
+                    spawn_tool.set_runtime(
+                        runtime_settings.provider,
+                        runtime_settings.effective_model,
+                        runtime_settings.request_options,
+                    )
 
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
@@ -180,9 +215,103 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _runtime_settings(self, session: Session) -> RuntimeSettings:
+        """Resolve provider/model/request options for the current session."""
+        effective_model, source = resolve_effective_model(
+            session=session,
+            config_default_model=self.config.agents.defaults.model or self.default_model,
+            provider_default_model=self.provider.get_default_model(),
+        )
+        request_options = build_request_options(session)
+        if source != "session" and effective_model == self.model:
+            return RuntimeSettings(
+                effective_model=effective_model,
+                model_source=source,
+                provider=self.provider,
+                request_options=request_options,
+            )
+
+        try:
+            provider = self.provider_factory.create(self.config, effective_model)
+            return RuntimeSettings(
+                effective_model=effective_model,
+                model_source=source,
+                provider=provider,
+                request_options=request_options,
+            )
+        except ProviderCreateError as e:
+            logger.warning("Failed to resolve provider for model '{}': {}", effective_model, e)
+
+        fallback_model = self.default_model or self.provider.get_default_model()
+        if fallback_model and fallback_model != effective_model:
+            try:
+                provider = self.provider_factory.create(self.config, fallback_model)
+                return RuntimeSettings(
+                    effective_model=fallback_model,
+                    model_source="config",
+                    provider=provider,
+                    request_options=request_options,
+                )
+            except ProviderCreateError as e:
+                logger.warning("Fallback model '{}' also failed: {}", fallback_model, e)
+
+        # Last-resort fallback keeps the loop alive with startup provider.
+        return RuntimeSettings(
+            effective_model=self.model,
+            model_source="provider",
+            provider=self.provider,
+            request_options=request_options,
+        )
+
+    async def _handle_new_command(self, msg: InboundMessage, session: Session) -> OutboundMessage:
+        """Handle /new with memory archival and lock safety."""
+        lock = self._get_consolidation_lock(session.key)
+        self._consolidating.add(session.key)
+        runtime = self._runtime_settings(session)
+        try:
+            async with lock:
+                snapshot = session.messages[session.last_consolidated:]
+                if snapshot:
+                    temp = Session(key=session.key)
+                    temp.messages = list(snapshot)
+                    self._consolidation_runtime_overrides[id(temp)] = runtime
+                    try:
+                        ok = await self._consolidate_memory(temp, archive_all=True)
+                    finally:
+                        self._consolidation_runtime_overrides.pop(id(temp), None)
+                    if not ok:
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Memory archival failed, session not cleared. Please try again.",
+                        )
+        except Exception:
+            logger.exception("/new archival failed for {}", session.key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Memory archival failed, session not cleared. Please try again.",
+            )
+        finally:
+            self._consolidating.discard(session.key)
+            self._prune_consolidation_lock(session.key, lock)
+
+        session.clear()
+        self.sessions.save(session)
+        self.sessions.invalidate(session.key)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="New session started.",
+            metadata=msg.metadata or {},
+        )
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        provider: LLMProvider,
+        model: str,
+        request_options: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -194,12 +323,13 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            response = await provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                request_options=request_options,
             )
 
             if response.has_tool_calls:
@@ -316,13 +446,24 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            runtime = self._runtime_settings(session)
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                runtime_settings=runtime,
+            )
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                provider=runtime.provider,
+                model=runtime.effective_model,
+                request_options=runtime.request_options,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -334,50 +475,31 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            lock = self._get_consolidation_lock(session.key)
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
-                self._prune_consolidation_lock(session.key, lock)
+        command_response = await self.command_router.handle(msg, session)
+        if command_response is not None:
+            return command_response
 
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
-        if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+        runtime = self._runtime_settings(session)
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
             lock = self._get_consolidation_lock(session.key)
+            consolidation_snapshot = RuntimeSettings(
+                effective_model=runtime.effective_model,
+                model_source=runtime.model_source,
+                provider=runtime.provider,
+                request_options=dict(runtime.request_options) if runtime.request_options else None,
+            )
 
             async def _consolidate_and_unlock():
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        self._consolidation_runtime_overrides[id(session)] = consolidation_snapshot
+                        try:
+                            await self._consolidate_memory(session)
+                        finally:
+                            self._consolidation_runtime_overrides.pop(id(session), None)
                 finally:
                     self._consolidating.discard(session.key)
                     self._prune_consolidation_lock(session.key, lock)
@@ -388,7 +510,12 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            runtime_settings=runtime,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -410,7 +537,11 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            provider=runtime.provider,
+            model=runtime.effective_model,
+            request_options=runtime.request_options,
+            on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
@@ -446,10 +577,14 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(self, session: Session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        runtime = self._consolidation_runtime_overrides.get(id(session)) or self._runtime_settings(session)
         return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
+            session,
+            runtime.provider,
+            runtime.effective_model,
+            request_options=runtime.request_options,
             archive_all=archive_all, memory_window=self.memory_window,
         )
 

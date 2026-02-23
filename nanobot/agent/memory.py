@@ -71,6 +71,7 @@ class MemoryStore:
         session: Session,
         provider: LLMProvider,
         model: str,
+        request_options: dict | None = None,
         *,
         archive_all: bool = False,
         memory_window: int = 50,
@@ -118,6 +119,7 @@ class MemoryStore:
                 ],
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
+                request_options=request_options,
             )
 
             if not response.has_tool_calls:

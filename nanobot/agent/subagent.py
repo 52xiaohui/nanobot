@@ -1,21 +1,26 @@
 """Subagent manager for background task execution."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
-from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import register_web_tools
+from nanobot.providers.base import LLMProvider
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
 
 class SubagentManager:
@@ -36,8 +41,8 @@ class SubagentManager:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
-        web_config: "WebToolsConfig | None" = None,
-        exec_config: "ExecToolConfig | None" = None,
+        web_config: WebToolsConfig | None = None,
+        exec_config: ExecToolConfig | None = None,
         restrict_to_workspace: bool = False,
         mcp_servers: dict | None = None,
     ):
@@ -63,6 +68,9 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        provider: LLMProvider | None = None,
+        model: str | None = None,
+        request_options: dict[str, Any] | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -83,10 +91,21 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
         }
+        provider_snapshot = provider or self.provider
+        model_snapshot = model or self.model
+        request_options_snapshot = dict(request_options) if request_options else None
         
         # Create background task
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(
+                task_id,
+                task,
+                display_label,
+                origin,
+                provider_snapshot,
+                model_snapshot,
+                request_options_snapshot,
+            )
         )
         self._running_tasks[task_id] = bg_task
         
@@ -102,6 +121,9 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        provider: LLMProvider,
+        model: str,
+        request_options: dict[str, Any] | None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -147,12 +169,13 @@ class SubagentManager:
                 while iteration < max_iterations:
                     iteration += 1
                     
-                    response = await self.provider.chat(
+                    response = await provider.chat(
                         messages=messages,
                         tools=tools.get_definitions(),
-                        model=self.model,
+                        model=model,
                         temperature=self.temperature,
                         max_tokens=self.max_tokens,
+                        request_options=request_options,
                     )
                     
                     if response.has_tool_calls:

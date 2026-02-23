@@ -20,6 +20,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from nanobot import __version__, __logo__
 from nanobot.config.schema import Config
+from nanobot.providers.factory import ProviderCreateError, ProviderFactory
 
 app = typer.Typer(
     name="nanobot",
@@ -29,6 +30,7 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+_PROVIDER_FACTORY = ProviderFactory()
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -231,55 +233,12 @@ def _create_workspace_templates(workspace: Path):
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-    from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
-    from nanobot.providers.custom_provider import CustomProvider
-
     model = config.agents.defaults.model
-    model_lower = model.lower()
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    # OpenAI Responses API (API key based)
-    if model_lower.startswith("openai-responses/") or model_lower.startswith("openai_responses/"):
-        openai_cfg = config.providers.openai
-        if not openai_cfg.api_key:
-            console.print("[red]Error: No OpenAI API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers.openai.apiKey")
-            raise typer.Exit(1)
-        return OpenAIResponsesProvider(
-            api_key=openai_cfg.api_key,
-            api_base=openai_cfg.api_base,
-            default_model=model,
-        )
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model_lower.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    from nanobot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
+    try:
+        return _PROVIDER_FACTORY.create(config, model)
+    except ProviderCreateError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
 
 
 # ============================================================================
@@ -322,6 +281,8 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
+        provider_factory=_PROVIDER_FACTORY,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
@@ -476,6 +437,8 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
+        provider_factory=_PROVIDER_FACTORY,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
@@ -967,6 +930,8 @@ def cron_run(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
+        provider_factory=_PROVIDER_FACTORY,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,

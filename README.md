@@ -154,6 +154,18 @@ nanobot agent
 
 That's it! You have a working AI assistant in 2 minutes.
 
+### Session Slash Commands
+
+During a conversation (CLI or chat channels), nanobot supports:
+
+- `/new`: Start a new conversation (keeps session runtime overrides)
+- `/model`: Show current session model/provider
+- `/model <model_name>`: Switch model for current session only
+- `/model reset`: Clear session model override
+- `/think`: Show current thinking effort
+- `/think <low|medium|high>`: Set session thinking effort
+- `/think reset`: Clear session thinking override
+
 ## 💬 Chat Apps
 
 Connect nanobot to your favorite chat platform.

@@ -9,6 +9,10 @@ import httpx
 import json_repair
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.responses_compat import (
+    convert_messages as _convert_messages,
+    convert_tools as _convert_tools,
+)
 
 DEFAULT_RESPONSES_URL = "https://api.openai.com/v1/responses"
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
@@ -34,6 +38,7 @@ class OpenAIResponsesProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        request_options: dict[str, Any] | None = None,
     ) -> LLMResponse:
         selected_model = _strip_responses_model_prefix(model or self.default_model)
         instructions, input_items = _convert_messages(messages)
@@ -48,6 +53,9 @@ class OpenAIResponsesProvider(LLMProvider):
         }
         if instructions:
             body["instructions"] = instructions
+        reasoning_effort = _reasoning_effort(request_options)
+        if reasoning_effort:
+            body["reasoning"] = {"effort": reasoning_effort}
         if tools:
             body["tools"] = _convert_tools(tools)
             body["tool_choice"] = "auto"
@@ -58,14 +66,7 @@ class OpenAIResponsesProvider(LLMProvider):
         }
 
         try:
-            try:
-                payload = await _post_json(self.url, headers, body)
-            except RuntimeError as e:
-                if _is_temperature_error(str(e)):
-                    body.pop("temperature", None)
-                    payload = await _post_json(self.url, headers, body)
-                else:
-                    raise
+            payload = await _post_json_with_fallbacks(self.url, headers, body)
             return _parse_response(payload)
         except Exception as e:
             return LLMResponse(
@@ -93,112 +94,26 @@ def _strip_responses_model_prefix(model: str) -> str:
     return model
 
 
-def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert OpenAI chat function schema to Responses function schema."""
-    converted: list[dict[str, Any]] = []
-    for tool in tools:
-        fn = (tool.get("function") or {}) if tool.get("type") == "function" else tool
-        name = fn.get("name")
-        if not name:
-            continue
-        params = fn.get("parameters") or {}
-        converted.append(
-            {
-                "type": "function",
-                "name": name,
-                "description": fn.get("description") or "",
-                "parameters": params if isinstance(params, dict) else {},
-            }
-        )
-    return converted
-
-
-def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    system_parts: list[str] = []
-    input_items: list[dict[str, Any]] = []
-
-    for idx, msg in enumerate(messages):
-        role = msg.get("role")
-        content = msg.get("content")
-
-        if role == "system":
-            if isinstance(content, str) and content:
-                system_parts.append(content)
-            continue
-
-        if role == "user":
-            input_items.append(_convert_user_message(content))
-            continue
-
-        if role == "assistant":
-            if isinstance(content, str) and content:
-                input_items.append(
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": content}],
-                    }
-                )
-            for tool_call in msg.get("tool_calls", []) or []:
-                fn = tool_call.get("function") or {}
-                call_id, item_id = _split_tool_call_id(tool_call.get("id"))
-                call_id = call_id or f"call_{idx}"
-                item_id = item_id or f"fc_{idx}"
-                input_items.append(
-                    {
-                        "type": "function_call",
-                        "id": item_id,
-                        "call_id": call_id,
-                        "name": fn.get("name"),
-                        "arguments": fn.get("arguments") or "{}",
-                    }
-                )
-            continue
-
-        if role == "tool":
-            call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            input_items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                }
-            )
-
-    return "\n\n".join(system_parts), input_items
-
-
-def _convert_user_message(content: Any) -> dict[str, Any]:
-    if isinstance(content, str):
-        return {"role": "user", "content": [{"type": "input_text", "text": content}]}
-
-    if isinstance(content, list):
-        converted: list[dict[str, Any]] = []
-        for item in content:
-            if not isinstance(item, dict):
+async def _post_json_with_fallbacks(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry request after removing unsupported optional fields."""
+    working = dict(body)
+    for _ in range(3):
+        try:
+            return await _post_json(url, headers, working)
+        except RuntimeError as e:
+            message = str(e)
+            if "temperature" in working and _is_temperature_error(message):
+                working.pop("temperature", None)
                 continue
-            if item.get("type") == "text":
-                converted.append({"type": "input_text", "text": item.get("text", "")})
+            if "reasoning" in working and _is_reasoning_effort_error(message):
+                working.pop("reasoning", None)
                 continue
-            if item.get("type") == "image_url":
-                image = item.get("image_url") or {}
-                url = image.get("url")
-                if url:
-                    converted.append({"type": "input_image", "image_url": url, "detail": "auto"})
-        if converted:
-            return {"role": "user", "content": converted}
-
-    return {"role": "user", "content": [{"type": "input_text", "text": ""}]}
-
-
-def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
-    if isinstance(tool_call_id, str) and tool_call_id:
-        if "|" in tool_call_id:
-            call_id, item_id = tool_call_id.split("|", 1)
-            return call_id, item_id or None
-        return tool_call_id, None
-    return "call_0", None
+            raise
+    raise RuntimeError("OpenAI Responses request failed after fallbacks.")
 
 
 async def _post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
@@ -307,9 +222,27 @@ def _loads_json(raw: Any) -> Any:
     return raw
 
 
+def _reasoning_effort(request_options: dict[str, Any] | None) -> str | None:
+    if not isinstance(request_options, dict):
+        return None
+    value = request_options.get("reasoning_effort")
+    if isinstance(value, str):
+        value = value.lower().strip()
+        if value in {"low", "medium", "high"}:
+            return value
+    return None
+
+
 def _is_temperature_error(message: str) -> bool:
     text = message.lower()
     if "temperature" not in text:
+        return False
+    return any(part in text for part in ("unsupported", "unknown", "invalid", "not allowed"))
+
+
+def _is_reasoning_effort_error(message: str) -> bool:
+    text = message.lower()
+    if "reasoning" not in text:
         return False
     return any(part in text for part in ("unsupported", "unknown", "invalid", "not allowed"))
 

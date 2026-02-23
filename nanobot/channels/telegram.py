@@ -9,6 +9,7 @@ from telegram import BotCommand, Update, ReplyParameters
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
+from nanobot.agent.commands import render_public_help
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -111,6 +112,8 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("model", "Show or set session model"),
+        BotCommand("think", "Show or set thinking effort"),
         BotCommand("help", "Show available commands"),
     ]
     
@@ -146,6 +149,8 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("model", self._forward_command))
+        self._app.add_handler(CommandHandler("think", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
         
         # Add message handler for text, photos, voice, documents
@@ -286,6 +291,15 @@ class TelegramChannel(BaseChannel):
             return
 
         user = update.effective_user
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await update.message.reply_text(
+                f"Hi {user.first_name}, I'm nanobot.\n\n"
+                "You can use /help for public guidance.\n"
+                "Ask the administrator to grant access for full features."
+            )
+            return
+
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
             "Send me a message and I'll respond!\n"
@@ -293,13 +307,28 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command, bypassing ACL so all users can access it."""
-        if not update.message:
+        """Handle /help: allowed users route to core help, others get public help."""
+        if not update.message or not update.effective_user:
             return
+
+        sender_id = self._sender_id(update.effective_user)
+        if self.is_allowed(sender_id):
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=str(update.message.chat_id),
+                content="/help",
+                metadata={
+                    "message_id": update.message.message_id,
+                    "user_id": update.effective_user.id,
+                    "username": update.effective_user.username,
+                    "first_name": update.effective_user.first_name,
+                    "is_group": update.message.chat.type != "private",
+                },
+            )
+            return
+
         await update.message.reply_text(
-            "🐈 nanobot commands:\n"
-            "/new — Start a new conversation\n"
-            "/help — Show available commands"
+            render_public_help(),
         )
 
     @staticmethod

@@ -6,6 +6,7 @@ from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
+    from nanobot.providers.base import LLMProvider
 
 
 class SpawnTool(Tool):
@@ -20,11 +21,25 @@ class SpawnTool(Tool):
         self._manager = manager
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
+        self._provider: "LLMProvider | None" = None
+        self._model: str | None = None
+        self._request_options: dict[str, Any] | None = None
     
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
+
+    def set_runtime(
+        self,
+        provider: "LLMProvider",
+        model: str,
+        request_options: dict[str, Any] | None,
+    ) -> None:
+        """Set runtime snapshot used by spawned subagents."""
+        self._provider = provider
+        self._model = model
+        self._request_options = dict(request_options) if request_options else None
     
     @property
     def name(self) -> str:
@@ -62,4 +77,7 @@ class SpawnTool(Tool):
             label=label,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
+            provider=self._provider,
+            model=self._model,
+            request_options=self._request_options,
         )

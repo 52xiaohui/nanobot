@@ -1,6 +1,5 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import json
 import json_repair
 import os
 from typing import Any
@@ -150,6 +149,24 @@ class LiteLLMProvider(LLMProvider):
                 if pattern in model_lower:
                     kwargs.update(overrides)
                     return
+
+    @staticmethod
+    def _reasoning_effort(request_options: dict[str, Any] | None) -> str | None:
+        if not isinstance(request_options, dict):
+            return None
+        value = request_options.get("reasoning_effort")
+        if isinstance(value, str):
+            value = value.lower().strip()
+            if value in {"low", "medium", "high"}:
+                return value
+        return None
+
+    @staticmethod
+    def _is_reasoning_effort_error(message: str) -> bool:
+        text = message.lower()
+        if "reasoning_effort" not in text:
+            return False
+        return any(part in text for part in ("unsupported", "unknown", "invalid", "not allowed"))
     
     @staticmethod
     def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -170,6 +187,7 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        request_options: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -215,6 +233,10 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
+
+        reasoning_effort = self._reasoning_effort(request_options)
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         
         if tools:
             kwargs["tools"] = tools
@@ -224,6 +246,16 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            if "reasoning_effort" in kwargs and self._is_reasoning_effort_error(str(e)):
+                try:
+                    kwargs.pop("reasoning_effort", None)
+                    response = await acompletion(**kwargs)
+                    return self._parse_response(response)
+                except Exception as retry_error:
+                    return LLMResponse(
+                        content=f"Error calling LLM: {str(retry_error)}",
+                        finish_reason="error",
+                    )
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
