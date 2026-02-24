@@ -179,7 +179,7 @@ class WebSearchTool(Tool):
         mcp_tool: str = "tavily_search",
         mcp_executor: ToolExecutor | None = None,
     ):
-        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+        self.api_key = api_key
         self.max_results = max_results
         self.backend = (backend or "brave").strip().lower()
         self.mcp_server = mcp_server
@@ -196,8 +196,13 @@ class WebSearchTool(Tool):
         return await self._execute_brave(query=query, count=n)
 
     async def _execute_brave(self, query: str, count: int) -> str:
-        if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
+        api_key = self.api_key or os.environ.get("BRAVE_API_KEY", "")
+        if not api_key:
+            return (
+                "Error: Brave Search API key not configured. "
+                "Set it in ~/.nanobot/config.json under tools.web.search.apiKey "
+                "(or export BRAVE_API_KEY), then restart the gateway."
+            )
 
         try:
             async with httpx.AsyncClient() as client:
@@ -206,7 +211,7 @@ class WebSearchTool(Tool):
                     params={"q": query, "count": count},
                     headers={
                         "Accept": "application/json",
-                        "X-Subscription-Token": self.api_key,
+                        "X-Subscription-Token": api_key,
                     },
                     timeout=10.0,
                 )
